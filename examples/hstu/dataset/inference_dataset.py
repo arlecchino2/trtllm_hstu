@@ -112,6 +112,9 @@ class InferenceDataset(IterableDataset[Batch]):
                 batch_logs_file, delimiter=",", nrows=batch_nrows
             )
 
+        self._batch_logs_frame = self._batch_logs_frame[ 
+            self._batch_logs_frame["interval_indptr"] <= 20000
+        ]
         self._batch_logs_frame.sort_values(by=timestamp_names, inplace=True)
         len(self._batch_logs_frame)
 
