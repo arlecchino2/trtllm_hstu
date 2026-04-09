@@ -154,6 +154,7 @@ def get_inference_hstu_model(
     num_contextual_features,
     total_max_seqlen,
     checkpoint_dir,
+    enable_timing_stats,
 ):
     network_args = NetworkArgs()
     if network_args.dtype_str == "bfloat16":
@@ -183,12 +184,13 @@ def get_inference_hstu_model(
     )
 
     kvcache_args = {
-        "blocks_in_primary_pool": 10240,
+        "blocks_in_primary_pool": 40960,
         "page_size": 32,
         "offload_chunksize": 1024,
         "max_batch_size": max_batch_size,
         "max_seq_len": math.ceil(total_max_seqlen / 32) * 32,
     }
+    print(f"offload_chunksize: {kvcache_args['offload_chunksize']}")
     kv_cache_config = get_kvcache_config(**kvcache_args)
 
     ranking_args = RankingArgs()
@@ -210,14 +212,15 @@ def get_inference_hstu_model(
         hstu_config=hstu_config,
         kvcache_config=kv_cache_config,
         task_config=task_config,
-        use_cudagraph=True,
+        use_cudagraph=False,
         cudagraph_configs=hstu_cudagraph_configs,
+        enable_timing_stats=enable_timing_stats,
     )
     if hstu_config.bf16:
         model.bfloat16()
     elif hstu_config.fp16:
         model.half()
-    model.load_checkpoint(checkpoint_dir)
+    # model.load_checkpoint(checkpoint_dir)
     model.eval()
 
     return model
@@ -227,6 +230,7 @@ def run_ranking_gr_simulate(
     checkpoint_dir: str,
     check_auc: bool = False,
     disable_contextual_features: bool = False,
+    enable_timing_stats: bool = False,
 ):
     dataset_args, emb_configs = get_inference_dataset_and_embedding_configs(
         disable_contextual_features
@@ -239,7 +243,8 @@ def run_ranking_gr_simulate(
         else 0
     )
 
-    max_batch_size = 1
+    max_batch_size = 8
+    print(f"max_bs: {max_batch_size}")
     total_max_seqlen = dataset_args.max_sequence_length * 2 + num_contextual_features
     print("total_max_seqlen", total_max_seqlen)
 
@@ -250,6 +255,7 @@ def run_ranking_gr_simulate(
             num_contextual_features,
             total_max_seqlen,
             checkpoint_dir,
+            enable_timing_stats,
         )
 
         if check_auc:
@@ -285,17 +291,25 @@ def run_ranking_gr_simulate(
         cur_date = None
         while True:
             try:
+                num_batches_ctr += 1
+                if num_batches_ctr == 3000:
+                    start_time = time.time()
                 uids, dates, seq_endptrs = next(dataloader_iter)
+                if num_batches_ctr % 1000 == 0:
+                    print(f"{num_batches_ctr}, uids: {uids.tolist()}, seq_endptrs: {seq_endptrs.tolist()}")
+                    
                 if dates[0] != cur_date:
+                    # if cur_date is not None:
+                    #     eval_metric_dict = eval_module.compute()
+                    #     print(
+                    #         f"[eval]:\n    "
+                    #         + stringify_dict(
+                    #             eval_metric_dict, prefix="Metrics", sep="\n    "
+                    #         )
+                    #     )
+                    # model.clear_kv_cache()
                     if cur_date is not None:
-                        eval_metric_dict = eval_module.compute()
-                        print(
-                            f"[eval]:\n    "
-                            + stringify_dict(
-                                eval_metric_dict, prefix="Metrics", sep="\n    "
-                            )
-                        )
-                    model.clear_kv_cache()
+                        break
                     cur_date = dates[0]
                 cached_start_pos, cached_len = model.get_user_kvdata_info(
                     uids, dbg_print=True
@@ -321,7 +335,7 @@ def run_ranking_gr_simulate(
                         uids[non_contextual_mask].int(),
                         new_cache_start_pos[non_contextual_mask],
                     )
-                    eval_module(logits, batch_0.labels)
+                    # eval_module(logits, batch_0.labels)
 
                 batch_1 = dataset.get_input_batch(
                     uids[contextual_mask],
@@ -337,14 +351,18 @@ def run_ranking_gr_simulate(
                         uids[contextual_mask].int(),
                         new_cache_start_pos[contextual_mask],
                     )
-                    eval_module(logits, batch_1.labels)
+                    # eval_module(logits, batch_1.labels)
+                
+                if num_batches_ctr % 1000 == 0 and num_batches_ctr > 3000:
+                    model._print_timing_summary()
 
-                num_batches_ctr += 1
             except StopIteration:
                 break
         end_time = time.time()
         print("Total #batch:", num_batches_ctr)
         print("Total time(s):", end_time - start_time)
+        if enable_timing_stats:
+            model._print_timing_summary()
 
 
 def run_ranking_gr_evaluate(
@@ -460,10 +478,12 @@ if __name__ == "__main__":
     )
     parser.add_argument("--disable_auc", action="store_true")
     parser.add_argument("--disable_context", action="store_true")
+    parser.add_argument('--gpu', type=int, default=1, help='GPU id for inference')
 
     args = parser.parse_args()
     gin.parse_config_file(args.gin_config_file)
 
+    torch.cuda.set_device(args.gpu)
     if args.mode == RunningMode.EVAL:
         if args.disable_auc:
             print("disable_auc is ignored in Eval mode.")
@@ -475,4 +495,5 @@ if __name__ == "__main__":
             checkpoint_dir=args.checkpoint_dir,
             check_auc=not args.disable_auc,
             disable_contextual_features=args.disable_context,
+            enable_timing_stats=True,
         )

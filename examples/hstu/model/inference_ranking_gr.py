@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import os
+import time
 import warnings
 from typing import List, Optional, Tuple, Union
 
@@ -118,6 +119,7 @@ class InferenceRankingGR(torch.nn.Module):
         task_config: RankingConfig,
         use_cudagraph=False,
         cudagraph_configs=None,
+        enable_timing_stats=False,
     ):
         super().__init__()
         self._device = torch.cuda.current_device()
@@ -195,6 +197,53 @@ class InferenceRankingGR(torch.nn.Module):
                 self._kvcache_metadata,
                 cudagraph_configs=cudagraph_configs,
             )
+        
+        # For statistics collection, wx done
+        self.enable_timing_stats = enable_timing_stats
+        self.timing_stats = {
+            'forward_with_cache': {'count': 0, 'total_time': 0.0, 'step_times': {}},
+            'forward_no_cache': {'count': 0, 'total_time': 0.0, 'step_times': {}}
+        }
+        self.count = 0
+        self.cache_stats = {
+            'total_gpu_length': 0,
+            'total_host_load_length': 0,
+            'total_new_tokens': 0,
+            'total_sequence_length': 0,
+            'batch_count': 0
+        }
+
+    def _update_timing_stats(self, method_name, timing_info):
+        if not self.enable_timing_stats:
+            return
+        stats = self.timing_stats[method_name]
+        stats['count'] += 1
+        stats['total_time'] += timing_info['total_time']
+        for step, duration in timing_info.items():
+            if step not in stats['step_times']:
+                stats['step_times'][step] = {'total': 0.0, 'count': 0}
+            stats['step_times'][step]['total'] += duration
+            stats['step_times'][step]['count'] += 1
+    
+    def _print_timing_summary(self):
+        if not self.enable_timing_stats:
+            return            
+        print("=" * 60)
+        print("TIMING SUMMARY")
+        
+        for method_name, stats in self.timing_stats.items():
+            if stats['count'] > 0:
+                avg_total = stats['total_time'] / stats['count']
+                print(f"\n{method_name.upper()}:")
+                print(f"  Total calls: {stats['count']}")
+                print(f"  Total time: {stats['total_time']:.6f}s")
+                print(f"  Average time per call: {avg_total:.6f}s")
+                
+                print("  Step-wise averages:")
+                for step, step_stats in stats['step_times'].items():
+                    avg_step = step_stats['total'] / step_stats['count']
+                    percentage = (avg_step / avg_total) * 100
+                    print(f"    {step}: {avg_step:.6f}s ({percentage:.1f}%)")
 
     def bfloat16(self):
         """
@@ -472,20 +521,46 @@ class InferenceRankingGR(torch.nn.Module):
         user_start_pos: torch.Tensor,
     ):
         with torch.inference_mode():
+            if self.enable_timing_stats:
+                start_time = time.time()
+                timing_info = {}
+            # 1. Prepare KV cache metadata
+            if self.enable_timing_stats:
+                prepare_kvcache_start = time.time()
             user_start_pos_cuda = user_start_pos.to(
                 device=torch.cuda.current_device(), non_blocking=True
             )
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['prepare_kvcache_async'] = time.time() - prepare_kvcache_start
+
+            # 2. Batch preprocessing
+            if self.enable_timing_stats:
+                batch_pre_start = time.time()
             embeddings = self._embedding_collection(batch.features)
             embeddings, batch = self.strip_contextual_features(
                 embeddings, batch, user_start_pos
             )
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['batch_pre'] = time.time() - batch_pre_start
+            
+            # 3. Preprocessing
+            if self.enable_timing_stats:
+                preprocess_start = time.time()
             jagged_data = self._hstu_block._preprocessor(
                 embeddings=embeddings,
                 batch=batch,
                 seq_start_position=user_start_pos_cuda,
             )
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['preprocessing'] = time.time() - preprocess_start
 
+            # 4. HSTU block forward
+            if self.enable_timing_stats:
+                hstu_start = time.time()
             num_tokens = batch.features.values().shape[0]
             if self.use_cudagraph:
                 self._hidden_states[:num_tokens, ...].copy_(
@@ -518,7 +593,14 @@ class InferenceRankingGR(torch.nn.Module):
                     kvcache_metadata,
                 )
                 jagged_data.values = hstu_output
-
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['hstu_inference'] = time.time() - hstu_start
+            # print("complete hstu inference")
+            
+            # 5. Offload KV cache and Postpreprocessing
+            if self.enable_timing_stats:
+                offload_post_start = time.time()
             self._gpu_kv_cache_manager._offload_start_event.record(
                 torch.cuda.current_stream()
             )
@@ -530,5 +612,14 @@ class InferenceRankingGR(torch.nn.Module):
             )
             self.offload_kv_cache_wait(self._offload_states)
             self.finalize_kv_cache(user_ids)
+            
+            if self.enable_timing_stats:
+                torch.cuda.synchronize()
+                timing_info['offload_and_postprocess'] = time.time() - offload_post_start
+                timing_info['total_time'] = time.time() - start_time
+
+                self.count += 1
+                if self.count > 3000:
+                    self._update_timing_stats('forward_with_cache', timing_info)
 
         return jagged_item_logit
