@@ -532,7 +532,7 @@ class InferenceRankingGR(torch.nn.Module):
                 device=torch.cuda.current_device(), non_blocking=True
             )
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
-            # Comlete onload before forward, wx done.
+            # Complete onload before forward, wx done.
             kvcache_metadata.onload_history_kv_events[self.num_layers].wait(
                 torch.cuda.current_stream()
             )

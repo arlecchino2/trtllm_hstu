@@ -20,6 +20,11 @@ import time
 from dataclasses import dataclass
 from typing import List, Tuple, cast
 
+import sys
+import os
+sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+
 import gin
 import torch
 from commons.utils.stringify import stringify_dict
