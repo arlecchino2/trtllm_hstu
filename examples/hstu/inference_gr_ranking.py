@@ -300,7 +300,22 @@ def run_ranking_gr_simulate(
                 if num_batches_ctr == 3000:
                     start_time = time.time()
                 uids, dates, seq_endptrs = next(dataloader_iter)
-                if num_batches_ctr % 1000 == 0:
+
+                # Deduplicate users while preserving the original batch order.
+                if uids.numel() > 1:
+                    seen = set()
+                    keep = []
+                    for idx, uid in enumerate(uids.cpu().tolist()):
+                        if uid not in seen:
+                            seen.add(uid)
+                            keep.append(idx)
+                    if len(keep) != uids.size(0):
+                        keep_idx = torch.tensor(keep, device=uids.device, dtype=torch.long)
+                        uids = uids[keep_idx]
+                        dates = dates[keep_idx]
+                        seq_endptrs = seq_endptrs[keep_idx]
+
+                if num_batches_ctr % 1000 == 1:
                     print(f"{num_batches_ctr}, uids: {uids.tolist()}, seq_endptrs: {seq_endptrs.tolist()}")
                     
                 if dates[0] != cur_date:
@@ -358,7 +373,7 @@ def run_ranking_gr_simulate(
                     )
                     # eval_module(logits, batch_1.labels)
                 
-                if num_batches_ctr % 1000 == 0 and num_batches_ctr > 3000:
+                if num_batches_ctr % 1000 == 1 and num_batches_ctr > 3000:
                     model._print_timing_summary()
 
             except StopIteration:
