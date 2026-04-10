@@ -185,6 +185,7 @@ class InferenceRankingGR(torch.nn.Module):
             self._gpu_kv_cache_manager.get_kvcache_table(layer_idx)
             for layer_idx in range(hstu_config.num_layers)
         ]
+        self.num_layers = hstu_config.num_layers
 
         # TODO(junyiq): Add cudagraph optimization for the MLP as well.
         self.use_cudagraph = use_cudagraph
@@ -531,6 +532,10 @@ class InferenceRankingGR(torch.nn.Module):
                 device=torch.cuda.current_device(), non_blocking=True
             )
             kvcache_metadata = self.prepare_kv_cache(batch, user_ids, user_start_pos)
+            # Comlete onload before forward, wx done.
+            kvcache_metadata.onload_history_kv_events[self.num_layers].wait(
+                torch.cuda.current_stream()
+            )
             if self.enable_timing_stats:
                 torch.cuda.synchronize()
                 timing_info['prepare_kvcache_async'] = time.time() - prepare_kvcache_start
